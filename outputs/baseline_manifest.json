@@ -1,0 +1,9 @@
+{
+  "selected_candidate": "blend_median_ridge__spc_last_missing",
+  "selected_feature_variant": "spc_last_missing",
+  "selected_alpha": 300.0,
+  "selected_ridge_weight": 0.1,
+  "groupkfold_mae": 4.743265537224503,
+  "n_train_samples": 180,
+  "n_submission_samples": 20
+}

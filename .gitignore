@@ -1,0 +1,21 @@
+# Competition data and copied source pages
+mt-ai-innovation-challenge-drug-prophet/
+mt-ai-innovation-challenge-drug-prophet.zip
+overview.docx
+data.docx
+
+# Generated feature matrices and diagnostics
+outputs/*
+!outputs/submission_baseline.csv
+!outputs/baseline_manifest.json
+!outputs/baseline_candidate_results.csv
+!outputs/baseline_window_mae.csv
+
+# Python/cache/editor noise
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
