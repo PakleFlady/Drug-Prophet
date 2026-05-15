@@ -14,7 +14,12 @@ RANDOM_SEED = 20260516
 
 
 def make_group_folds(groups: pd.Series, n_splits: int = 5, seed: int = RANDOM_SEED) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Create GroupKFold-like splits without depending on scikit-learn."""
+    """Create GroupKFold-like splits without depending on scikit-learn.
+
+    The same fermentation batch appears under multiple early-window samples.
+    Splitting randomly by sample_id would leak batch-level information, so all
+    rows from one batch must stay in the same fold.
+    """
     unique_groups = np.array(sorted(groups.unique()))
     rng = np.random.default_rng(seed)
     rng.shuffle(unique_groups)
@@ -31,6 +36,7 @@ def make_group_folds(groups: pd.Series, n_splits: int = 5, seed: int = RANDOM_SE
 
 
 def numeric_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Keep numeric columns that can be summarized into model features."""
     excluded = {"sample_id", "control_type"}
     return [
         col
@@ -40,6 +46,7 @@ def numeric_feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _slope(values: pd.Series, times: pd.Series) -> float:
+    """Estimate a simple linear trend for one variable inside one sample."""
     mask = values.notna() & times.notna()
     if mask.sum() < 2:
         return np.nan
@@ -53,7 +60,12 @@ def _slope(values: pd.Series, times: pd.Series) -> float:
 
 
 def build_sample_features(series: pd.DataFrame) -> pd.DataFrame:
-    """Collapse each variable-length early window into one row per sample_id."""
+    """Collapse each variable-length early window into one row per sample_id.
+
+    Kaggle expects one prediction per sample_id, but each sample_id contains a
+    time series. This function turns the sequence into tabular features using
+    summary statistics, endpoint values, missingness, and trend estimates.
+    """
     feature_cols = numeric_feature_columns(series)
     stats_cols = [
         col
@@ -62,11 +74,13 @@ def build_sample_features(series: pd.DataFrame) -> pd.DataFrame:
     ]
 
     rows: list[dict[str, float | int | str]] = []
+    # Sort before grouping so "first" and "last" follow the real time order.
     grouped = series.sort_values(["sample_id", "step_idx"]).groupby("sample_id", sort=False)
 
     for sample_id, group in grouped:
         row: dict[str, float | int | str] = {"sample_id": sample_id}
 
+        # These metadata fields are constant within a released sample window.
         row["batch_id"] = int(group["batch_id"].iloc[0])
         row["control_type_id"] = int(group["control_type_id"].iloc[0])
         row["window_pct"] = int(group["window_pct"].iloc[0])
@@ -74,6 +88,7 @@ def build_sample_features(series: pd.DataFrame) -> pd.DataFrame:
         row["t_rel_max"] = float(group["t_rel"].max())
         row["time_h_max"] = float(group["Time..h."].max())
 
+        # One-hot encode the batch control strategy for linear models.
         control_type = str(group["control_type"].iloc[0])
         for value in ["recipe", "operator", "apc"]:
             row[f"control_type__{value}"] = 1.0 if control_type == value else 0.0
@@ -81,15 +96,20 @@ def build_sample_features(series: pd.DataFrame) -> pd.DataFrame:
         times = group["t_rel"]
         for col in stats_cols:
             values = group[col]
+            # Distribution-level summaries describe the overall observed window.
             row[f"{col}__mean"] = float(values.mean(skipna=True))
             row[f"{col}__std"] = float(values.std(skipna=True))
             row[f"{col}__min"] = float(values.min(skipna=True))
             row[f"{col}__max"] = float(values.max(skipna=True))
             row[f"{col}__median"] = float(values.median(skipna=True))
+            # Missingness is kept as a feature because industrial sensors and
+            # offline assays can be absent in informative, non-random ways.
             row[f"{col}__missing_frac"] = float(values.isna().mean())
 
             non_null = values.dropna()
             if len(non_null) > 0:
+                # Endpoint features often matter in early-window forecasting:
+                # the latest available state can be more useful than the mean.
                 first = float(non_null.iloc[0])
                 last = float(non_null.iloc[-1])
                 row[f"{col}__first"] = first
@@ -115,18 +135,24 @@ def prepare_matrix(
     valid_features: pd.DataFrame,
     feature_cols: list[str],
 ) -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
+    """Impute and standardize features using training-fold statistics only."""
     train_x = train_features[feature_cols].copy()
     valid_x = valid_features[feature_cols].copy()
 
+    # Drop columns that are fully missing in the training fold; their medians
+    # are undefined and they cannot help the model in this fold.
     all_nan_cols = [col for col in feature_cols if train_x[col].isna().all()]
     kept_cols = [col for col in feature_cols if col not in all_nan_cols]
     train_x = train_x[kept_cols]
     valid_x = valid_x[kept_cols]
 
+    # Median imputation is fit on the training fold and then applied to valid
+    # or test data to avoid validation leakage.
     medians = train_x.median(axis=0)
     train_x = train_x.fillna(medians).fillna(0.0)
     valid_x = valid_x.fillna(medians).fillna(0.0)
 
+    # Ridge is sensitive to feature scale, so standardize every numeric column.
     means = train_x.mean(axis=0)
     stds = train_x.std(axis=0).replace(0.0, 1.0).fillna(1.0)
 
@@ -138,6 +164,12 @@ def prepare_matrix(
 
 
 def fit_ridge_dual(x: np.ndarray, y: np.ndarray, alpha: float) -> tuple[np.ndarray, float]:
+    """Fit Ridge regression through the dual system.
+
+    After aggregation we have many more features than independent batches. The
+    dual form solves an n_samples by n_samples system, which is cheaper and
+    numerically friendlier here than inverting a huge feature matrix.
+    """
     y_mean = float(y.mean())
     y_centered = y - y_mean
 
@@ -162,6 +194,7 @@ def evaluate_alphas(
     feature_cols: list[str],
     alphas: list[float],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run grouped cross-validation for a list of Ridge regularization values."""
     train_df = features.merge(labels, on="sample_id", how="inner")
     folds = make_group_folds(train_df["batch_id"], n_splits=5)
 
@@ -170,7 +203,6 @@ def evaluate_alphas(
 
     for alpha in alphas:
         oof = np.full(len(train_df), np.nan)
-        fold_scores = []
         for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
             fold_train = train_df.iloc[train_idx]
             fold_valid = train_df.iloc[valid_idx]
@@ -182,7 +214,6 @@ def evaluate_alphas(
             oof[valid_idx] = pred
 
             fold_mae = mae(fold_valid["target_stable_mean"].to_numpy(dtype=float), pred)
-            fold_scores.append(fold_mae)
             result_rows.append(
                 {
                     "alpha": alpha,
@@ -221,6 +252,7 @@ def evaluate_alphas(
 
 
 def oof_global_median(features: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    """Build an out-of-fold global-median baseline for comparison and blending."""
     train_df = features.merge(labels, on="sample_id", how="inner")
     folds = make_group_folds(train_df["batch_id"], n_splits=5)
     oof = np.full(len(train_df), np.nan)
@@ -246,6 +278,7 @@ def ridge_submission_predictions(
     feature_cols: list[str],
     alpha: float,
 ) -> np.ndarray:
+    """Train one Ridge candidate on all labels and predict requested test rows."""
     train_df = train_features.merge(labels, on="sample_id", how="inner")
     requested_test = sample_submission[["sample_id"]].merge(test_features, on="sample_id", how="left")
 
@@ -264,6 +297,7 @@ def train_and_predict(
     alpha: float,
     output_dir: Path,
 ) -> pd.DataFrame:
+    """Legacy helper kept for pure-Ridge submission experiments."""
     train_df = train_features.merge(labels, on="sample_id", how="inner")
     requested_test = sample_submission[["sample_id"]].merge(test_features, on="sample_id", how="left")
     x_train, x_test, prep_info = prepare_matrix(train_df, requested_test, feature_cols)
@@ -289,6 +323,7 @@ def train_and_predict(
 
 
 def build_feature_variants(feature_cols: list[str]) -> dict[str, list[str]]:
+    """Define small candidate feature sets for conservative model selection."""
     compact_metadata = [
         "control_type_id",
         "window_pct",
@@ -300,13 +335,17 @@ def build_feature_variants(feature_cols: list[str]) -> dict[str, list[str]]:
         "control_type__apc",
     ]
     return {
+        # Full feature set is useful as a reference, but can overfit badly with
+        # only 45 independent training batches.
         "full_stats": feature_cols,
+        # Raman PCA endpoint plus missingness is a compact spectral signal.
         "spc_last_missing": [
             col
             for col in feature_cols
             if (col.startswith("spc_") and (col.endswith("__last") or col.endswith("__missing_frac")))
             or col in compact_metadata
         ],
+        # Broader endpoint/missingness feature set for process and spectrum.
         "last_delta_missing": [
             col
             for col in feature_cols
@@ -335,6 +374,8 @@ def main() -> None:
     train_features = build_sample_features(train_series)
     test_features = build_sample_features(test_series)
 
+    # Persist generated features for inspection. They are ignored by git because
+    # they can be recreated from the released Kaggle files.
     train_features.to_csv(output_dir / "train_sample_features.csv", index=False)
     test_features.to_csv(output_dir / "test_sample_features.csv", index=False)
 
@@ -347,6 +388,8 @@ def main() -> None:
     alphas = [0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0]
     feature_variants = build_feature_variants(feature_cols)
 
+    # Candidate search starts with a hard-to-beat median baseline. With so few
+    # independent batches, a complicated model must prove it beats this.
     all_cv_results = []
     best_oof_by_variant = {}
     candidate_rows = []
@@ -369,6 +412,8 @@ def main() -> None:
     )
 
     for variant_name, variant_cols in feature_variants.items():
+        # Pick the best regularization strength for each feature variant by
+        # out-of-fold MAE, always grouped by batch.
         cv_results, oof_predictions = evaluate_alphas(train_features, train_labels, variant_cols, alphas)
         cv_results["feature_variant"] = variant_name
         all_cv_results.append(cv_results)
@@ -392,6 +437,8 @@ def main() -> None:
         )
 
         for ridge_weight in np.linspace(0.05, 0.50, 10):
+            # Blend only a small amount of model signal into the median
+            # baseline. This reduces overfitting risk on the private split.
             blended = best_oof.copy()
             blended["oof_pred"] = (
                 ridge_weight * best_oof["oof_pred"].to_numpy(dtype=float)
@@ -419,6 +466,8 @@ def main() -> None:
     candidate_table.to_csv(output_dir / "baseline_candidate_results.csv", index=False)
     best_candidate = candidate_table.iloc[0]
 
+    # Refit the selected recipe on all training labels and predict only the
+    # sample_ids requested by sample_submission.csv.
     if best_candidate["candidate"] == "global_median":
         final_pred = np.full(
             len(sample_submission),
